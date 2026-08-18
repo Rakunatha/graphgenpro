@@ -44,36 +44,12 @@ except Exception:
     _groq_client = None
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB upload cap
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # keep Render free-tier requests bounded
 
 # In-memory store for the last few analyses so /download can rebuild the docx.
 # Fine for a single small Render instance; swap for redis/db if you need more.
 REPORT_CACHE = {}
-MAX_CACHE = 8
-
-# ---------------------------------------------------------------------------
-# Always return JSON on errors, never Flask/Werkzeug's default HTML error page.
-# This is what fixes "Unexpected token '<'" in the browser — that error means
-# the frontend received an HTML error page instead of JSON.
-# ---------------------------------------------------------------------------
-
-@app.errorhandler(413)
-def handle_413(e):
-    return jsonify({"error": "File is too large (25MB limit). Try a smaller file."}), 413
-
-
-@app.errorhandler(404)
-def handle_404(e):
-    return jsonify({"error": "Not found."}), 404
-
-
-@app.errorhandler(Exception)
-def handle_any_error(e):
-    from werkzeug.exceptions import HTTPException
-    if isinstance(e, HTTPException):
-        return jsonify({"error": e.description or str(e)}), e.code
-    traceback.print_exc()
-    return jsonify({"error": f"Server error: {e}"}), 500
+MAX_CACHE = 3
 
 # ---------------------------------------------------------------------------
 # Column classification
@@ -165,7 +141,7 @@ def make_bar_chart(df, iv, dv):
     ct = pd.crosstab(sub[iv], sub[dv], normalize="index") * 100
     ct = ct.round(1)
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.0), dpi=110)
+    fig, ax = plt.subplots(figsize=(6.8, 4.0), dpi=110)
     ct.plot(kind="bar", ax=ax, color=SPSS_PALETTE[: len(ct.columns)], edgecolor="black", linewidth=0.5)
 
     for container in ax.containers:
@@ -262,6 +238,7 @@ def ai_generate_narrative(facts, anova, composite_label):
             temperature=0.4,
             max_tokens=4000,
             response_format={"type": "json_object"},
+            timeout=20,
         )
         text = resp.choices[0].message.content
         data = json.loads(text)
@@ -480,9 +457,7 @@ def analyze():
             return jsonify({"error": "Could not detect independent/dependent variables automatically."}), 400
 
         # cap total charts for a snappy free-tier response
-        # (override with the MAX_CHARTS env var if your host needs it lower, e.g.
-        # Render's free tier is slow — try MAX_CHARTS=25 if you see timeouts)
-        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 60))
+        MAX_CHARTS = 24
         chart_records = []
         preview_records = []
         facts = []
@@ -527,20 +502,33 @@ def analyze():
             ai_results_text = ai_data["results"]
             ai_discussion_text = ai_data["discussion"]
 
+        # Build the DOCX once during analysis. Rebuilding all charts inside
+        # /download could exceed Render's request timeout and return an HTML 500 page.
+        title = "GraphGen Pro - Automated Analysis Report"
+        report_docx = build_docx(
+            title, iv_cols, dv_cols, chart_records, anova, composite_label,
+            ai_results_text=ai_results_text,
+            ai_discussion_text=ai_discussion_text,
+            ai_used=ai_used,
+        )
+        report_bytes = report_docx.getvalue()
+
         report_id = str(uuid.uuid4())
         REPORT_CACHE[report_id] = {
-            "title": "GraphGen Pro - Automated Analysis Report",
+            "title": title,
             "iv_cols": iv_cols, "dv_cols": dv_cols,
             "chart_records": chart_records, "anova": anova,
             "composite_label": composite_label,
             "ai_used": ai_used,
             "ai_results_text": ai_results_text,
             "ai_discussion_text": ai_discussion_text,
+            "docx_bytes": report_bytes,
         }
         if len(REPORT_CACHE) > MAX_CACHE:
             REPORT_CACHE.pop(next(iter(REPORT_CACHE)))
 
-        for rec in chart_records[:12]:
+        # Only send a small preview to the browser; full images stay server-side.
+        for rec in chart_records[:6]:
             preview_records.append({
                 "iv": rec["iv"], "dv": rec["dv"], "legend": rec["legend"],
                 "img": "data:image/png;base64," + base64.b64encode(rec["png"]).decode(),
@@ -572,19 +560,40 @@ def analyze():
 def download(report_id):
     data = REPORT_CACHE.get(report_id)
     if not data:
-        return "Report expired or not found. Please re-analyze your file.", 404
-    out = build_docx(
-        data["title"], data["iv_cols"], data["dv_cols"],
-        data["chart_records"], data["anova"], data["composite_label"],
-        ai_results_text=data.get("ai_results_text"),
-        ai_discussion_text=data.get("ai_discussion_text"),
-        ai_used=data.get("ai_used", False),
-    )
+        return jsonify({
+            "error": "Report expired or not found. Please re-analyze your file."
+        }), 404
+
+    # Lightweight endpoint: the DOCX was already generated during /analyze.
+    docx_bytes = data.get("docx_bytes")
+    if not docx_bytes:
+        return jsonify({
+            "error": "The report file is unavailable. Please re-analyze your file."
+        }), 500
+
     return send_file(
-        out, as_attachment=True,
+        io.BytesIO(docx_bytes),
+        as_attachment=True,
         download_name="GraphGen_Pro_Report.docx",
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        max_age=0,
     )
+
+
+@app.errorhandler(413)
+def request_too_large(error):
+    return jsonify({
+        "error": "File is too large. Please upload an XLSX/CSV file smaller than 15 MB."
+    }), 413
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    # API routes return JSON instead of Flask/Render's HTML error page.
+    traceback.print_exc()
+    if request.path.startswith("/analyze") or request.path.startswith("/download/"):
+        return jsonify({"error": "Internal server error. Check the server logs for details."}), 500
+    return error
 
 
 @app.route("/health")
