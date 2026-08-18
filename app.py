@@ -188,6 +188,35 @@ def auto_legend_text(iv, dv, ct):
         return f"The chart compares {dv} across {iv} groups."
 
 
+def auto_result_sentence(iv, dv, ct):
+    """Rule-based, offline 'Results'-style sentence for one chart (objective, factual)."""
+    try:
+        top_group = ct.max(axis=1).idxmax()
+        top_cat = ct.loc[top_group].idxmax()
+        top_pct = ct.loc[top_group, top_cat]
+        return (
+            f"According to the chart, {top_pct:.0f}% of {top_group} respondents selected "
+            f"\u201c{top_cat}\u201d for \u201c{dv}\u201d, the strongest single pattern across {iv} groups."
+        )
+    except Exception:
+        return f"The chart reports responses to \u201c{dv}\u201d across {iv} groups."
+
+
+def auto_discussion_sentence(iv, dv, ct):
+    """Rule-based, offline 'Discussion'-style sentence for one chart (interpretive)."""
+    try:
+        top_group = ct.max(axis=1).idxmax()
+        top_cat = ct.loc[top_group].idxmax()
+        top_pct = ct.loc[top_group, top_cat]
+        return (
+            f"This suggests {top_group} respondents feel most strongly about \u201c{dv}\u201d, "
+            f"with {top_pct:.0f}% converging on \u201c{top_cat}\u201d -- a pattern worth weighing "
+            f"against the other {iv} groups shown."
+        )
+    except Exception:
+        return f"This points to a notable pattern in how {iv} groups responded to \u201c{dv}\u201d."
+
+
 def chart_fact(iv, dv, ct):
     """Compact numeric summary of one chart, used as input to the AI writer."""
     try:
@@ -202,9 +231,14 @@ def chart_fact(iv, dv, ct):
 def ai_generate_narrative(facts, anova, composite_label):
     """
     One batched call to Groq's free-tier API that writes every chart legend
-    plus the Results/Discussion paragraphs in a single request (keeps this
-    well within free rate limits even for 50+ charts). Returns None on any
-    failure so the caller can fall back to the rule-based text.
+    plus one Results-style and one Discussion-style sentence per chart (in
+    the same "ADDITIONAL ANALYSIS" report style used at this org: a running
+    narrative that cites each chart as it goes, e.g. "...(fig: 3)"). Keeps
+    this well within free rate limits even for 50+ charts since it's one
+    batched request. Returns None on any failure so the caller falls back
+    to the rule-based text -- the (fig: N) citations themselves are always
+    appended in code afterward, not trusted to the model, so numbering
+    never drifts even if the model's prose does.
     """
     if _groq_client is None:
         return None
@@ -222,17 +256,24 @@ def ai_generate_narrative(facts, anova, composite_label):
         }
 
     prompt = (
-        "You are writing an academic-style SPSS results report for a survey. "
+        "You are writing an academic-style SPSS survey report in the following house style: "
+        "a numbered FIGURE/LEGEND block per chart, followed by a RESULT section and a DISCUSSION "
+        "section that are each ONE continuous narrative walking through every chart in order "
+        "(each chart gets 1-3 sentences citing concrete percentages/groups, then the narrative "
+        "moves to the next chart) -- NOT a short high-level summary paragraph. "
         "Given the JSON facts below, respond with ONLY valid JSON (no markdown, no code fences) "
         "matching this exact shape:\n"
-        '{"legends": ["...", "..."], "results": "...", "discussion": "..."}\n\n'
+        '{"legends": ["...", ...], "results_sentences": ["...", ...], "discussion_sentences": ["...", ...]}\n\n'
         "Rules:\n"
         "- \"legends\" must have exactly one string per item in chart_facts, in the same order, "
         "each 1-2 sentences describing that specific chart's pattern (mention the top group/category/percent).\n"
-        "- \"results\" is a short objective paragraph (4-6 sentences) summarizing the overall patterns "
-        "across charts and reporting the ANOVA F, df, and p value in APA style if anova_summary is present.\n"
-        "- \"discussion\" is a short paragraph (4-6 sentences) interpreting what the results mean, "
-        "whether the ANOVA is statistically significant, and one caveat about survey data limitations.\n"
+        "- \"results_sentences\" must ALSO have exactly one string per item in chart_facts, in the same order: "
+        "an objective 1-3 sentence description of that chart's data (concrete percentages/groups). "
+        "Do not add a figure citation yourself -- it is appended automatically afterward.\n"
+        "- \"discussion_sentences\" must ALSO have exactly one string per item in chart_facts, in the same order: "
+        "a more interpretive 1-3 sentence take on what that chart's pattern suggests. Do not add a citation.\n"
+        "- If anova_summary is present, make the very last discussion_sentences item also mention the ANOVA "
+        "F, df, and p value in APA style and what it means for significance.\n"
         "- Do not invent numbers not present in the facts.\n\n"
         f"chart_facts = {json.dumps(facts)}\n"
         f"anova_summary = {json.dumps(anova_summary)}\n"
@@ -253,10 +294,9 @@ def ai_generate_narrative(facts, anova, composite_label):
         text = resp.choices[0].message.content
         data = json.loads(text)
         if (
-            isinstance(data.get("legends"), list)
-            and len(data["legends"]) == len(facts)
-            and isinstance(data.get("results"), str)
-            and isinstance(data.get("discussion"), str)
+            isinstance(data.get("legends"), list) and len(data["legends"]) == len(facts)
+            and isinstance(data.get("results_sentences"), list) and len(data["results_sentences"]) == len(facts)
+            and isinstance(data.get("discussion_sentences"), list) and len(data["discussion_sentences"]) == len(facts)
         ):
             return data
         return None
@@ -310,49 +350,62 @@ def run_anova(df, iv, dv_numeric_col_name, dv_values):
 # Word report builder
 # ---------------------------------------------------------------------------
 
-def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
-                ai_results_text=None, ai_discussion_text=None, ai_used=False):
-    doc = Document()
+def _set_base_font(doc):
+    """Match the reference report's font: Times New Roman 12pt body text."""
+    normal = doc.styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.font.size = Pt(12)
 
-    h = doc.add_heading(title, level=0)
-    h.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    doc.add_heading("1. Overview", level=1)
-    doc.add_paragraph(
-        f"This report was generated automatically by GraphGen Pro. It compares "
-        f"{len(dv_cols)} dependent (outcome) variable(s) against {len(iv_cols)} "
-        f"independent (grouping) variable(s), producing {len(chart_records)} "
-        f"comparison charts, followed by a one-way ANOVA."
-    )
+def _labeled_paragraph(doc, label, text):
+    """A paragraph like '**LEGEND:** some text', matching the reference style."""
     p = doc.add_paragraph()
-    p.add_run("Independent variables detected: ").bold = True
-    p.add_run(", ".join(iv_cols))
-    p2 = doc.add_paragraph()
-    p2.add_run("Dependent variables detected: ").bold = True
-    p2.add_run(", ".join(dv_cols))
+    p.add_run(f"{label}: ").bold = True
+    p.add_run(text)
+    return p
 
-    doc.add_heading("2. Comparison Charts", level=1)
-    for idx, rec in enumerate(chart_records, start=1):
-        doc.add_heading(f"Figure {idx}: {rec['dv']} by {rec['iv']}", level=2)
+
+def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
+                ai_results_sentences=None, ai_discussion_sentences=None, ai_used=False):
+    doc = Document()
+    _set_base_font(doc)
+
+    # Title -- bold plain paragraph, not a big Word Heading style.
+    title_p = doc.add_paragraph()
+    title_p.add_run("ADDITIONAL ANALYSIS").bold = True
+    doc.add_paragraph()
+
+    fig_num = 0
+
+    # One FIGURE / image / LEGEND block per chart, in order.
+    for rec in chart_records:
+        fig_num += 1
+        fig_p = doc.add_paragraph()
+        fig_p.add_run(f"FIGURE {fig_num}:").bold = True
+
         img_stream = io.BytesIO(rec["png"])
-        doc.add_picture(img_stream, width=Inches(6.0))
-        legend_p = doc.add_paragraph()
-        legend_p.add_run("LEGEND: ").bold = True
-        legend_p.add_run(rec["legend"])
+        doc.add_picture(img_stream, width=Inches(3.15))
 
-    doc.add_heading("3. ANOVA Test", level=1)
-    if anova is None:
-        doc.add_paragraph("An ANOVA could not be computed (not enough numeric/group data).")
-    else:
-        doc.add_paragraph(
-            f"A one-way ANOVA was run to test whether \u201c{composite_label}\u201d differs "
-            f"significantly across groups of \u201c{anova['iv']}\u201d."
-        )
+        _labeled_paragraph(doc, "LEGEND", rec["legend"])
+        doc.add_paragraph()
+
+    # ANOVA presented as its own numbered figure, SPSS "ANOVA" table style.
+    if anova is not None:
+        fig_num += 1
+        fig_p = doc.add_paragraph()
+        fig_p.add_run(f"FIGURE {fig_num}:").bold = True
+
+        cap = doc.add_paragraph()
+        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        cap_run = cap.add_run("ANOVA")
+        cap_run.bold = True
+
         table = doc.add_table(rows=4, cols=6)
-        table.style = "Light Grid Accent 1"
+        table.style = "Table Grid"
         hdr = table.rows[0].cells
         for i, txt in enumerate(["Source", "Sum of Squares", "df", "Mean Square", "F", "Sig."]):
             hdr[i].text = txt
+            hdr[i].paragraphs[0].runs[0].bold = True
         rows_data = [
             ("Between Groups", anova["ss_between"], anova["df_between"], anova["ms_between"], f"{anova['F']:.3f}", f"{anova['p']:.3f}"),
             ("Within Groups", anova["ss_within"], anova["df_within"], anova["ms_within"], "", ""),
@@ -362,15 +415,8 @@ def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
             cells = table.rows[r].cells
             for c, val in enumerate(row):
                 cells[c].text = f"{val:.3f}" if isinstance(val, float) else str(val)
-
         doc.add_paragraph()
-        gp = doc.add_paragraph()
-        gp.add_run("Group means: ").bold = True
-        for name, row in anova["group_stats"].iterrows():
-            doc.add_paragraph(f"  {name}: n={int(row['count'])}, mean={row['mean']}, sd={row['std']}", style=None)
 
-        interp = doc.add_paragraph()
-        interp.add_run("INTERPRETATION: ").bold = True
         sig_txt = (
             f"The model shows F({anova['df_between']}, {anova['df_within']}) = {anova['F']:.3f}, "
             f"p = {anova['p']:.3f}, which is {'below' if anova['significant'] else 'above'} the "
@@ -378,54 +424,46 @@ def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
             f"{'does' if anova['significant'] else 'does not'} have a statistically significant "
             f"effect on {composite_label}."
         )
-        interp.add_run(sig_txt)
-
-    doc.add_heading("4. Results", level=1)
-    if ai_results_text:
-        doc.add_paragraph(ai_results_text)
-    else:
-        doc.add_paragraph(
-            "The comparison charts above show how responses to each dependent variable vary across "
-            "each independent (demographic/grouping) variable. Patterns worth noting are called out "
-            "in each figure's legend."
+        _labeled_paragraph(
+            doc, "LEGEND",
+            f"This ANOVA table evaluates whether {anova['iv']} significantly predicts {composite_label}."
         )
-        if anova is not None:
-            doc.add_paragraph(
-                f"For the ANOVA, {anova['iv']} produced {'a statistically significant' if anova['significant'] else 'no statistically significant'} "
-                f"difference in mean {composite_label} across groups "
-                f"(F = {anova['F']:.2f}, p = {anova['p']:.3f})."
-            )
+        _labeled_paragraph(doc, "INTERPRETATION", sig_txt)
+        doc.add_paragraph()
 
-    doc.add_heading("5. Discussion", level=1)
-    if ai_discussion_text:
-        doc.add_paragraph(ai_discussion_text)
-    else:
-        if anova is not None and anova["significant"]:
-            doc.add_paragraph(
-                f"Because the ANOVA result is significant, this suggests genuine differences in "
-                f"{composite_label} between {anova['iv']} groups, rather than differences due to chance "
-                f"alone. Researchers should examine the group means table above to see which specific "
-                f"groups differ, and consider a post-hoc test (e.g., Tukey HSD) for pairwise comparisons."
-            )
-        elif anova is not None:
-            doc.add_paragraph(
-                f"Because the ANOVA result is not significant, the data do not provide strong evidence "
-                f"that {anova['iv']} groups differ in {composite_label}. Any differences visible in the "
-                f"bar charts are more likely attributable to sampling variation than to a true underlying "
-                f"effect, though a larger sample could reveal a smaller real effect."
-            )
-        doc.add_paragraph(
-            "Overall, the charts and statistical test together provide an SPSS-style descriptive and "
-            "inferential summary of how the independent variables relate to the dependent variables in "
-            "this dataset. As with any survey data, results should be interpreted alongside sample size, "
-            "response bias, and measurement limitations."
+    # RESULT: one continuous narrative, one entry per chart, each citing (fig: N).
+    result_label_p = doc.add_paragraph()
+    result_label_p.add_run("RESULT:").bold = True
+    result_p = doc.add_paragraph()
+    for idx, rec in enumerate(chart_records, start=1):
+        sentence = (
+            ai_results_sentences[idx - 1] if ai_results_sentences and idx - 1 < len(ai_results_sentences)
+            else auto_result_sentence(rec["iv"], rec["dv"], rec["ct"])
         )
+        result_p.add_run(sentence.strip() + " ")
+        result_p.add_run(f"(fig: {idx}) ").bold = True
+    doc.add_paragraph()
 
-    footer = doc.add_paragraph()
-    footer.add_run(
-        "Narrative generated with Groq (free-tier AI)." if ai_used
-        else "Narrative generated with GraphGen Pro's built-in rule-based writer (no AI key configured)."
-    ).italic = True
+    # DISCUSSION: same shape, more interpretive tone, plus an ANOVA callout at the end.
+    disc_label_p = doc.add_paragraph()
+    disc_label_p.add_run("DISCUSSION").bold = True
+    disc_p = doc.add_paragraph()
+    for idx, rec in enumerate(chart_records, start=1):
+        sentence = (
+            ai_discussion_sentences[idx - 1] if ai_discussion_sentences and idx - 1 < len(ai_discussion_sentences)
+            else auto_discussion_sentence(rec["iv"], rec["dv"], rec["ct"])
+        )
+        disc_p.add_run(sentence.strip() + " ")
+        disc_p.add_run(f"(fig: {idx}) ").bold = True
+    if anova is not None:
+        closing = (
+            f"Taken together with the ANOVA above (F = {anova['F']:.3f}, p = {anova['p']:.3f}), "
+            f"{anova['iv']} {'does' if anova['significant'] else 'does not'} appear to have a "
+            f"statistically significant relationship with {composite_label}, so any differences "
+            f"seen across the charts should be weighed against that result and the usual caveats "
+            f"of survey data (sample size, response bias, and measurement limitations)."
+        )
+        disc_p.add_run(closing)
 
     out = io.BytesIO()
     doc.save(out)
@@ -490,7 +528,7 @@ def analyze():
                 if png is None:
                     continue
                 fallback_legend = auto_legend_text(iv, dv, ct)
-                chart_records.append({"iv": iv, "dv": dv, "png": png, "legend": fallback_legend})
+                chart_records.append({"iv": iv, "dv": dv, "png": png, "legend": fallback_legend, "ct": ct})
                 facts.append(chart_fact(iv, dv, ct))
                 count += 1
             if count >= MAX_CHARTS:
@@ -509,26 +547,26 @@ def analyze():
             primary_iv = iv_cols[0]
             anova = run_anova(df, primary_iv, composite_label, composite)
 
-        # Try one batched Groq call to write every legend + Results/Discussion.
-        # Falls back silently (ai_used=False) if no key is set or the call fails.
+        # Try one batched Groq call to write every legend + per-chart Results/Discussion
+        # sentences. Falls back silently (ai_used=False) if no key is set or the call fails.
         ai_used = False
-        ai_results_text = None
-        ai_discussion_text = None
+        ai_results_sentences = None
+        ai_discussion_sentences = None
         ai_data = ai_generate_narrative(facts, anova, composite_label)
         if ai_data:
             ai_used = True
             for rec, legend in zip(chart_records, ai_data["legends"]):
                 rec["legend"] = legend
-            ai_results_text = ai_data["results"]
-            ai_discussion_text = ai_data["discussion"]
+            ai_results_sentences = ai_data["results_sentences"]
+            ai_discussion_sentences = ai_data["discussion_sentences"]
 
         # Build the DOCX once during analysis. Rebuilding all charts inside
         # /download could exceed Render's request timeout and return an HTML 500 page.
         title = "GraphGen Pro - Automated Analysis Report"
         report_docx = build_docx(
             title, iv_cols, dv_cols, chart_records, anova, composite_label,
-            ai_results_text=ai_results_text,
-            ai_discussion_text=ai_discussion_text,
+            ai_results_sentences=ai_results_sentences,
+            ai_discussion_sentences=ai_discussion_sentences,
             ai_used=ai_used,
         )
         report_bytes = report_docx.getvalue()
