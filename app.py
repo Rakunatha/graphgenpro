@@ -52,6 +52,30 @@ REPORT_CACHE = {}
 MAX_CACHE = 8
 
 # ---------------------------------------------------------------------------
+# Always return JSON on errors, never Flask/Werkzeug's default HTML error page.
+# This is what fixes "Unexpected token '<'" in the browser — that error means
+# the frontend received an HTML error page instead of JSON.
+# ---------------------------------------------------------------------------
+
+@app.errorhandler(413)
+def handle_413(e):
+    return jsonify({"error": "File is too large (25MB limit). Try a smaller file."}), 413
+
+
+@app.errorhandler(404)
+def handle_404(e):
+    return jsonify({"error": "Not found."}), 404
+
+
+@app.errorhandler(Exception)
+def handle_any_error(e):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return jsonify({"error": e.description or str(e)}), e.code
+    traceback.print_exc()
+    return jsonify({"error": f"Server error: {e}"}), 500
+
+# ---------------------------------------------------------------------------
 # Column classification
 # ---------------------------------------------------------------------------
 
@@ -141,7 +165,7 @@ def make_bar_chart(df, iv, dv):
     ct = pd.crosstab(sub[iv], sub[dv], normalize="index") * 100
     ct = ct.round(1)
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.3), dpi=150)
+    fig, ax = plt.subplots(figsize=(7.2, 4.0), dpi=110)
     ct.plot(kind="bar", ax=ax, color=SPSS_PALETTE[: len(ct.columns)], edgecolor="black", linewidth=0.5)
 
     for container in ax.containers:
@@ -456,7 +480,9 @@ def analyze():
             return jsonify({"error": "Could not detect independent/dependent variables automatically."}), 400
 
         # cap total charts for a snappy free-tier response
-        MAX_CHARTS = 60
+        # (override with the MAX_CHARTS env var if your host needs it lower, e.g.
+        # Render's free tier is slow — try MAX_CHARTS=25 if you see timeouts)
+        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 60))
         chart_records = []
         preview_records = []
         facts = []
