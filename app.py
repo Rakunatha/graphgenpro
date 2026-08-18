@@ -15,6 +15,7 @@ working with zero configuration and zero cost.
 
 import io
 import os
+import gc
 import json
 import base64
 import uuid
@@ -141,26 +142,35 @@ def make_bar_chart(df, iv, dv):
     ct = pd.crosstab(sub[iv], sub[dv], normalize="index") * 100
     ct = ct.round(1)
 
-    fig, ax = plt.subplots(figsize=(6.8, 4.0), dpi=110)
-    ct.plot(kind="bar", ax=ax, color=SPSS_PALETTE[: len(ct.columns)], edgecolor="black", linewidth=0.5)
+    # Smaller figsize/DPI keeps per-chart memory low -- important on Render's
+    # free 512MB instances where a report with 20+ charts can otherwise push
+    # the worker over its memory limit and get killed by the platform (which
+    # shows up to the browser as a bare, non-JSON "Internal Server Error"
+    # page rather than the app's own JSON error response).
+    fig, ax = plt.subplots(figsize=(6.0, 3.4), dpi=90)
+    try:
+        ct.plot(kind="bar", ax=ax, color=SPSS_PALETTE[: len(ct.columns)], edgecolor="black", linewidth=0.5)
 
-    for container in ax.containers:
-        ax.bar_label(container, fmt="%.0f%%", fontsize=7, padding=1)
+        for container in ax.containers:
+            ax.bar_label(container, fmt="%.0f%%", fontsize=7, padding=1)
 
-    ax.set_ylabel("Percent within group (%)", fontsize=9)
-    ax.set_xlabel(iv, fontsize=9)
-    ax.set_title(f"{dv}\nby {iv}", fontsize=10, wrap=True)
-    ax.legend(title=dv, fontsize=7, title_fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    plt.xticks(rotation=20, ha="right", fontsize=8)
-    plt.tight_layout()
+        ax.set_ylabel("Percent within group (%)", fontsize=9)
+        ax.set_xlabel(iv, fontsize=9)
+        ax.set_title(f"{dv}\nby {iv}", fontsize=10, wrap=True)
+        ax.legend(title=dv, fontsize=7, title_fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        plt.xticks(rotation=20, ha="right", fontsize=8)
+        plt.tight_layout()
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue(), ct
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+        return buf.getvalue(), ct
+    finally:
+        # Always release the figure, even if plotting raised partway through --
+        # otherwise a single bad column can leak a full Figure per request.
+        plt.close(fig)
 
 
 def auto_legend_text(iv, dv, ct):
@@ -449,6 +459,16 @@ def analyze():
         if df.empty:
             return jsonify({"error": "The file has no usable data."}), 400
 
+        # Cap extremely large spreadsheets. Render's free instances have only
+        # 512MB RAM, and pandas + matplotlib + python-docx all holding a huge
+        # dataframe (plus 20+ chart PNGs) at once is the most common cause of
+        # the worker being OOM-killed -- which surfaces to the browser as a
+        # bare "Internal Server Error" page instead of a JSON error, because
+        # the process dies before Flask's own error handler can run.
+        MAX_ROWS = int(os.environ.get("MAX_ROWS", 5000))
+        if len(df) > MAX_ROWS:
+            df = df.sample(n=MAX_ROWS, random_state=0).reset_index(drop=True)
+
         # Clean up messy header text (stray newlines/whitespace from form exports)
         df.columns = [" ".join(str(c).split()) for c in df.columns]
 
@@ -456,8 +476,9 @@ def analyze():
         if not iv_cols or not dv_cols:
             return jsonify({"error": "Could not detect independent/dependent variables automatically."}), 400
 
-        # cap total charts for a snappy free-tier response
-        MAX_CHARTS = 24
+        # cap total charts for a snappy, low-memory free-tier response
+        # (override with the MAX_CHARTS env var on Render if you need more/fewer)
+        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 12))
         chart_records = []
         preview_records = []
         facts = []
@@ -527,6 +548,13 @@ def analyze():
         if len(REPORT_CACHE) > MAX_CACHE:
             REPORT_CACHE.pop(next(iter(REPORT_CACHE)))
 
+        # Drop the (potentially large) source dataframe now that everything
+        # needed from it has been extracted, and force a GC pass so this
+        # worker's memory footprint doesn't keep climbing across requests.
+        n_rows = len(df)
+        del df
+        gc.collect()
+
         # Only send a small preview to the browser; full images stay server-side.
         for rec in chart_records[:6]:
             preview_records.append({
@@ -543,7 +571,7 @@ def analyze():
 
         return jsonify({
             "report_id": report_id,
-            "n_rows": int(len(df)),
+            "n_rows": int(n_rows),
             "iv_cols": iv_cols, "dv_cols": dv_cols,
             "total_charts": len(chart_records),
             "preview_charts": preview_records,
@@ -551,6 +579,13 @@ def analyze():
             "ai_used": ai_used,
         })
 
+    except MemoryError:
+        traceback.print_exc()
+        gc.collect()
+        return jsonify({
+            "error": "The file is too large/complex to process on this server's memory limit. "
+                     "Try a smaller file, fewer columns, or lower MAX_ROWS/MAX_CHARTS."
+        }), 500
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": f"Something went wrong: {e}"}), 500
