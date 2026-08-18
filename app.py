@@ -45,12 +45,12 @@ except Exception:
     _groq_client = None
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # keep Render free-tier requests bounded
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # keep Render free-tier requests bounded
 
 # In-memory store for the last few analyses so /download can rebuild the docx.
 # Fine for a single small Render instance; swap for redis/db if you need more.
 REPORT_CACHE = {}
-MAX_CACHE = 3
+MAX_CACHE = 2
 
 # ---------------------------------------------------------------------------
 # Column classification
@@ -147,7 +147,7 @@ def make_bar_chart(df, iv, dv):
     # the worker over its memory limit and get killed by the platform (which
     # shows up to the browser as a bare, non-JSON "Internal Server Error"
     # page rather than the app's own JSON error response).
-    fig, ax = plt.subplots(figsize=(6.0, 3.4), dpi=90)
+    fig, ax = plt.subplots(figsize=(5.4, 3.0), dpi=80)
     try:
         ct.plot(kind="bar", ax=ax, color=SPSS_PALETTE[: len(ct.columns)], edgecolor="black", linewidth=0.5)
 
@@ -449,25 +449,24 @@ def analyze():
         if not f:
             return jsonify({"error": "No file uploaded."}), 400
 
+        # Cap extremely large spreadsheets *before* fully loading them --
+        # capping rows only after pd.read_csv/read_excel has already parsed
+        # the entire file into memory doesn't help; a large/wide file can
+        # OOM the 512MB Render free instance during the read itself,
+        # especially .xlsx (openpyxl commonly uses 10-20x the file's raw
+        # size in RAM). Reading with nrows keeps peak memory bounded by the
+        # cap, not by the uploaded file's size.
+        MAX_ROWS = int(os.environ.get("MAX_ROWS", 1500))
+
         filename = f.filename.lower()
         if filename.endswith(".csv"):
-            df = pd.read_csv(f)
+            df = pd.read_csv(f, nrows=MAX_ROWS)
         else:
-            df = pd.read_excel(f)
+            df = pd.read_excel(f, nrows=MAX_ROWS)
 
         df = df.dropna(axis=1, how="all")
         if df.empty:
             return jsonify({"error": "The file has no usable data."}), 400
-
-        # Cap extremely large spreadsheets. Render's free instances have only
-        # 512MB RAM, and pandas + matplotlib + python-docx all holding a huge
-        # dataframe (plus 20+ chart PNGs) at once is the most common cause of
-        # the worker being OOM-killed -- which surfaces to the browser as a
-        # bare "Internal Server Error" page instead of a JSON error, because
-        # the process dies before Flask's own error handler can run.
-        MAX_ROWS = int(os.environ.get("MAX_ROWS", 5000))
-        if len(df) > MAX_ROWS:
-            df = df.sample(n=MAX_ROWS, random_state=0).reset_index(drop=True)
 
         # Clean up messy header text (stray newlines/whitespace from form exports)
         df.columns = [" ".join(str(c).split()) for c in df.columns]
@@ -478,7 +477,7 @@ def analyze():
 
         # cap total charts for a snappy, low-memory free-tier response
         # (override with the MAX_CHARTS env var on Render if you need more/fewer)
-        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 12))
+        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 6))
         chart_records = []
         preview_records = []
         facts = []
@@ -533,16 +532,10 @@ def analyze():
             ai_used=ai_used,
         )
         report_bytes = report_docx.getvalue()
+        del report_docx  # the in-memory Document + all its embedded images
 
         report_id = str(uuid.uuid4())
         REPORT_CACHE[report_id] = {
-            "title": title,
-            "iv_cols": iv_cols, "dv_cols": dv_cols,
-            "chart_records": chart_records, "anova": anova,
-            "composite_label": composite_label,
-            "ai_used": ai_used,
-            "ai_results_text": ai_results_text,
-            "ai_discussion_text": ai_discussion_text,
             "docx_bytes": report_bytes,
         }
         if len(REPORT_CACHE) > MAX_CACHE:
@@ -618,7 +611,7 @@ def download(report_id):
 @app.errorhandler(413)
 def request_too_large(error):
     return jsonify({
-        "error": "File is too large. Please upload an XLSX/CSV file smaller than 15 MB."
+        "error": "File is too large. Please upload an XLSX/CSV file smaller than 8 MB."
     }), 413
 
 
