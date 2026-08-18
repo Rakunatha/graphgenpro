@@ -191,18 +191,23 @@ function renderResults(data){
     <div class="stat"><b>${data.total_charts}</b><span>Charts generated</span></div>
   `;
 
+  const aiBadge = data.ai_used
+    ? '<span style="background:#e6f4ea;color:#1a7f37;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700;">✨ Written by Groq AI</span>'
+    : '<span style="background:#eef1f5;color:#6b7280;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700;">Built-in writer (no AI key set)</span>';
+
   if (data.anova){
     const sigClass = data.anova.significant ? 'sig-yes' : 'sig-no';
     const sigWord = data.anova.significant ? 'Significant (p < 0.05)' : 'Not significant (p ≥ 0.05)';
     anovaSection.innerHTML = `
       <div class="anova-box">
+        <div style="margin-bottom:8px;">${aiBadge}</div>
         <b>One-Way ANOVA</b> — Overall attitude score grouped by <b>${data.anova.iv}</b><br>
         F = ${data.anova.F} &nbsp;|&nbsp; p = ${data.anova.p} &nbsp;|&nbsp;
         <span class="${sigClass}">${sigWord}</span>
       </div>
     `;
   } else {
-    anovaSection.innerHTML = `<div class="anova-box">ANOVA could not be computed for this dataset.</div>`;
+    anovaSection.innerHTML = `<div class="anova-box">${aiBadge}<br>ANOVA could not be computed for this dataset.</div>`;
   }
 
   chartNote.textContent = `Showing a preview of ${Math.min(data.preview_charts.length, data.total_charts)} of ${data.total_charts} charts. The Word report includes all of them.`;
