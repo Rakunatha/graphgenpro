@@ -9,12 +9,13 @@ Upload a survey spreadsheet (.xlsx or .csv) and GraphGen Pro will:
 3. Run a **one-way ANOVA** comparing an overall composite attitude score across
    the primary independent variable's groups (F, p, SPSS-style ANOVA table).
 4. Let you **download a Word (.docx) report** containing every chart with an
-   auto-written legend, the ANOVA table, an interpretation, and a
-   Results/Discussion section — written by a free, built-in rule-based text
-   generator (no paid AI API key needed).
+   AI-written legend (via Groq's free API — see below), the ANOVA table, an
+   interpretation, and a Results/Discussion section.
 
-It's a single small Flask app + one HTML page. No database, no signup, no
-API keys required to run it.
+It's a single small Flask app + one HTML page. No database. Groq's free tier
+needs only a free signup to get an API key (no credit card, no paid plan). If
+you skip that setup entirely, the app still works using a built-in offline
+text writer as a fallback (see below).
 
 ## Project structure
 
@@ -41,20 +42,37 @@ python app.py
 Open http://localhost:5000, upload a spreadsheet, click **Analyze Data**, then
 **Download Full Word Report**.
 
-## How the "AI" works (and why it's free)
+## How the AI works (Groq, free tier)
 
-No external AI API call is required. `auto_legend_text()` and the
-Results/Discussion section in `build_docx()` in `app.py` generate natural-language
-sentences from the actual computed percentages and ANOVA statistics (a
-template/rule-based generator). This means:
+Text (every chart's legend + the Results and Discussion paragraphs) is written
+by [Groq](https://console.groq.com) — an LLM API with a **free tier**, no
+credit card required.
 
-- Zero API cost, zero API keys, works fully offline.
-- If you *do* want nicer, more varied prose later, you can optionally wire in
-  a free-tier LLM call (e.g. set an `ANTHROPIC_API_KEY` env var and post the
-  same figures/stats to `/v1/messages`, then use that text instead of the
-  template sentence) — the code is structured so that's a drop-in swap inside
-  `auto_legend_text()` and `build_docx()`. This is optional and the app works
-  fully without it.
+1. Go to https://console.groq.com/keys and create a free API key.
+2. Set it as an environment variable named `GROQ_API_KEY`:
+   ```bash
+   export GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx   # locally
+   ```
+   On Render: **Dashboard → your service → Environment → Add Environment
+   Variable** → key `GROQ_API_KEY`, value = your key. Redeploy.
+3. That's it — the app automatically detects the key and uses AI-written text.
+
+**What actually happens under the hood:** all the numbers (which group had the
+highest %, the ANOVA F/p, etc.) are computed in Python with pandas/scipy —
+the AI is never asked to do math, only to turn already-computed facts into
+natural sentences. All charts' legends plus the Results/Discussion section are
+requested in a **single batched API call** (not one call per chart), so even
+a report with 50-60 charts stays comfortably inside Groq's free rate limits.
+
+**No key set, or the Groq call fails/times out?** The app automatically falls
+back to a built-in, offline, rule-based sentence generator (`auto_legend_text`
+in `app.py`) — the app never breaks and never requires payment. The web UI
+shows a small badge ("✨ Written by Groq AI" vs. "Built-in writer") so you can
+always see which one produced a given report.
+
+You can change the model via the `GROQ_MODEL` env var (default:
+`llama-3.3-70b-versatile`). See https://console.groq.com/docs/models for the
+current list of free models.
 
 ## How variables are detected
 
