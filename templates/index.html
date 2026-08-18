@@ -151,7 +151,7 @@ function handleFileChosen(){
 analyzeBtn.addEventListener('click', async () => {
   if (!fileInput.files.length) return;
   spinner.style.display = 'block';
-  statusMsg.textContent = 'Analyzing your data...';
+  statusMsg.textContent = 'Analyzing your data... (large files with many charts can take a minute or two)';
   statusMsg.classList.remove('err');
   analyzeBtn.disabled = true;
   resultsCard.classList.add('hidden');
@@ -161,12 +161,28 @@ analyzeBtn.addEventListener('click', async () => {
 
   try {
     const res = await fetch('/analyze', { method: 'POST', body: formData });
-    const data = await res.json();
+
+    const contentType = res.headers.get('content-type') || '';
+    let data;
+    if (contentType.includes('application/json')) {
+      data = await res.json();
+    } else {
+      // Server (or a proxy in front of it) returned something that isn't JSON —
+      // most often an HTML error page. Surface a readable message instead of
+      // letting JSON.parse throw "Unexpected token '<'".
+      const raw = await res.text();
+      throw new Error(
+        `Server returned an unexpected response (status ${res.status}). ` +
+        `This usually means the request timed out or the file is too large/complex. ` +
+        `Try a smaller file, or check the server logs. Details: ${raw.slice(0, 200)}`
+      );
+    }
+
     spinner.style.display = 'none';
     analyzeBtn.disabled = false;
 
     if (!res.ok || data.error) {
-      statusMsg.textContent = data.error || 'Analysis failed.';
+      statusMsg.textContent = data.error || `Analysis failed (status ${res.status}).`;
       statusMsg.classList.add('err');
       return;
     }
@@ -176,7 +192,7 @@ analyzeBtn.addEventListener('click', async () => {
   } catch (err) {
     spinner.style.display = 'none';
     analyzeBtn.disabled = false;
-    statusMsg.textContent = 'Network or server error: ' + err;
+    statusMsg.textContent = 'Error: ' + err.message;
     statusMsg.classList.add('err');
   }
 });
