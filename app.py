@@ -6,15 +6,16 @@ generate SPSS-style grouped bar charts for every IV x DV pair -> run a one-way
 ANOVA -> export a Word document with figures, legends, an ANOVA table and an
 auto-written Results & Discussion section.
 
-100% free to run: no paid AI API is required. Interpretation sentences are
-produced by a rule-based text generator (see `narrate.py` logic inline below).
-If you set an ANTHROPIC_API_KEY environment variable, the app will instead ask
-Claude to polish the Results/Discussion paragraphs (optional, still works fine
-without it).
+100% free to run. Text is written by Groq (https://console.groq.com), which has
+a free API tier — set a GROQ_API_KEY environment variable to turn it on. If no
+key is set, or the Groq call fails/times out for any reason, the app silently
+falls back to a built-in rule-based sentence generator so it always keeps
+working with zero configuration and zero cost.
 """
 
 import io
 import os
+import json
 import base64
 import uuid
 import traceback
@@ -31,6 +32,16 @@ from scipy import stats
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+# --- Groq (free-tier AI) -----------------------------------------------------
+# pip install groq. Get a free key at https://console.groq.com/keys
+# Set it as an environment variable: GROQ_API_KEY=gsk_...
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+try:
+    from groq import Groq
+    _groq_client = Groq(api_key=os.environ["GROQ_API_KEY"]) if os.environ.get("GROQ_API_KEY") else None
+except Exception:
+    _groq_client = None
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB upload cap
@@ -153,7 +164,7 @@ def make_bar_chart(df, iv, dv):
 
 
 def auto_legend_text(iv, dv, ct):
-    """Rule-based 'AI' legend/result sentence — no external API needed."""
+    """Rule-based legend/result sentence — the offline fallback, always available."""
     try:
         top_group = ct.max(axis=1).idxmax()
         top_cat = ct.loc[top_group].idxmax()
@@ -165,6 +176,82 @@ def auto_legend_text(iv, dv, ct):
         )
     except Exception:
         return f"The chart compares {dv} across {iv} groups."
+
+
+def chart_fact(iv, dv, ct):
+    """Compact numeric summary of one chart, used as input to the AI writer."""
+    try:
+        top_group = ct.max(axis=1).idxmax()
+        top_cat = ct.loc[top_group].idxmax()
+        top_pct = float(ct.loc[top_group, top_cat])
+        return {"iv": iv, "dv": dv, "top_group": str(top_group), "top_category": str(top_cat), "top_pct": round(top_pct, 1)}
+    except Exception:
+        return {"iv": iv, "dv": dv, "top_group": None, "top_category": None, "top_pct": None}
+
+
+def ai_generate_narrative(facts, anova, composite_label):
+    """
+    One batched call to Groq's free-tier API that writes every chart legend
+    plus the Results/Discussion paragraphs in a single request (keeps this
+    well within free rate limits even for 50+ charts). Returns None on any
+    failure so the caller can fall back to the rule-based text.
+    """
+    if _groq_client is None:
+        return None
+
+    anova_summary = None
+    if anova is not None:
+        anova_summary = {
+            "grouping_variable": anova["iv"],
+            "outcome": composite_label,
+            "F": round(anova["F"], 3),
+            "p": round(anova["p"], 4),
+            "significant": anova["significant"],
+            "df_between": anova["df_between"],
+            "df_within": anova["df_within"],
+        }
+
+    prompt = (
+        "You are writing an academic-style SPSS results report for a survey. "
+        "Given the JSON facts below, respond with ONLY valid JSON (no markdown, no code fences) "
+        "matching this exact shape:\n"
+        '{"legends": ["...", "..."], "results": "...", "discussion": "..."}\n\n'
+        "Rules:\n"
+        "- \"legends\" must have exactly one string per item in chart_facts, in the same order, "
+        "each 1-2 sentences describing that specific chart's pattern (mention the top group/category/percent).\n"
+        "- \"results\" is a short objective paragraph (4-6 sentences) summarizing the overall patterns "
+        "across charts and reporting the ANOVA F, df, and p value in APA style if anova_summary is present.\n"
+        "- \"discussion\" is a short paragraph (4-6 sentences) interpreting what the results mean, "
+        "whether the ANOVA is statistically significant, and one caveat about survey data limitations.\n"
+        "- Do not invent numbers not present in the facts.\n\n"
+        f"chart_facts = {json.dumps(facts)}\n"
+        f"anova_summary = {json.dumps(anova_summary)}\n"
+    )
+
+    try:
+        resp = _groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": "You write precise, concise, factual survey-analysis reports. Output strict JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+            max_tokens=4000,
+            response_format={"type": "json_object"},
+        )
+        text = resp.choices[0].message.content
+        data = json.loads(text)
+        if (
+            isinstance(data.get("legends"), list)
+            and len(data["legends"]) == len(facts)
+            and isinstance(data.get("results"), str)
+            and isinstance(data.get("discussion"), str)
+        ):
+            return data
+        return None
+    except Exception:
+        traceback.print_exc()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +299,8 @@ def run_anova(df, iv, dv_numeric_col_name, dv_values):
 # Word report builder
 # ---------------------------------------------------------------------------
 
-def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label):
+def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
+                ai_results_text=None, ai_discussion_text=None, ai_used=False):
     doc = Document()
 
     h = doc.add_heading(title, level=0)
@@ -282,39 +370,51 @@ def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label):
         interp.add_run(sig_txt)
 
     doc.add_heading("4. Results", level=1)
-    doc.add_paragraph(
-        "The comparison charts above show how responses to each dependent variable vary across "
-        "each independent (demographic/grouping) variable. Patterns worth noting are called out "
-        "in each figure's legend."
-    )
-    if anova is not None:
+    if ai_results_text:
+        doc.add_paragraph(ai_results_text)
+    else:
         doc.add_paragraph(
-            f"For the ANOVA, {anova['iv']} produced {'a statistically significant' if anova['significant'] else 'no statistically significant'} "
-            f"difference in mean {composite_label} across groups "
-            f"(F = {anova['F']:.2f}, p = {anova['p']:.3f})."
+            "The comparison charts above show how responses to each dependent variable vary across "
+            "each independent (demographic/grouping) variable. Patterns worth noting are called out "
+            "in each figure's legend."
         )
+        if anova is not None:
+            doc.add_paragraph(
+                f"For the ANOVA, {anova['iv']} produced {'a statistically significant' if anova['significant'] else 'no statistically significant'} "
+                f"difference in mean {composite_label} across groups "
+                f"(F = {anova['F']:.2f}, p = {anova['p']:.3f})."
+            )
 
     doc.add_heading("5. Discussion", level=1)
-    if anova is not None and anova["significant"]:
+    if ai_discussion_text:
+        doc.add_paragraph(ai_discussion_text)
+    else:
+        if anova is not None and anova["significant"]:
+            doc.add_paragraph(
+                f"Because the ANOVA result is significant, this suggests genuine differences in "
+                f"{composite_label} between {anova['iv']} groups, rather than differences due to chance "
+                f"alone. Researchers should examine the group means table above to see which specific "
+                f"groups differ, and consider a post-hoc test (e.g., Tukey HSD) for pairwise comparisons."
+            )
+        elif anova is not None:
+            doc.add_paragraph(
+                f"Because the ANOVA result is not significant, the data do not provide strong evidence "
+                f"that {anova['iv']} groups differ in {composite_label}. Any differences visible in the "
+                f"bar charts are more likely attributable to sampling variation than to a true underlying "
+                f"effect, though a larger sample could reveal a smaller real effect."
+            )
         doc.add_paragraph(
-            f"Because the ANOVA result is significant, this suggests genuine differences in "
-            f"{composite_label} between {anova['iv']} groups, rather than differences due to chance "
-            f"alone. Researchers should examine the group means table above to see which specific "
-            f"groups differ, and consider a post-hoc test (e.g., Tukey HSD) for pairwise comparisons."
+            "Overall, the charts and statistical test together provide an SPSS-style descriptive and "
+            "inferential summary of how the independent variables relate to the dependent variables in "
+            "this dataset. As with any survey data, results should be interpreted alongside sample size, "
+            "response bias, and measurement limitations."
         )
-    elif anova is not None:
-        doc.add_paragraph(
-            f"Because the ANOVA result is not significant, the data do not provide strong evidence "
-            f"that {anova['iv']} groups differ in {composite_label}. Any differences visible in the "
-            f"bar charts are more likely attributable to sampling variation than to a true underlying "
-            f"effect, though a larger sample could reveal a smaller real effect."
-        )
-    doc.add_paragraph(
-        "Overall, the charts and statistical test together provide an SPSS-style descriptive and "
-        "inferential summary of how the independent variables relate to the dependent variables in "
-        "this dataset. As with any survey data, results should be interpreted alongside sample size, "
-        "response bias, and measurement limitations."
-    )
+
+    footer = doc.add_paragraph()
+    footer.add_run(
+        "Narrative generated with Groq (free-tier AI)." if ai_used
+        else "Narrative generated with GraphGen Pro's built-in rule-based writer (no AI key configured)."
+    ).italic = True
 
     out = io.BytesIO()
     doc.save(out)
@@ -359,6 +459,7 @@ def analyze():
         MAX_CHARTS = 60
         chart_records = []
         preview_records = []
+        facts = []
         count = 0
         for dv in dv_cols:
             for iv in iv_cols:
@@ -367,8 +468,9 @@ def analyze():
                 png, ct = make_bar_chart(df, iv, dv)
                 if png is None:
                     continue
-                legend = auto_legend_text(iv, dv, ct)
-                chart_records.append({"iv": iv, "dv": dv, "png": png, "legend": legend})
+                fallback_legend = auto_legend_text(iv, dv, ct)
+                chart_records.append({"iv": iv, "dv": dv, "png": png, "legend": fallback_legend})
+                facts.append(chart_fact(iv, dv, ct))
                 count += 1
             if count >= MAX_CHARTS:
                 break
@@ -386,12 +488,28 @@ def analyze():
             primary_iv = iv_cols[0]
             anova = run_anova(df, primary_iv, composite_label, composite)
 
+        # Try one batched Groq call to write every legend + Results/Discussion.
+        # Falls back silently (ai_used=False) if no key is set or the call fails.
+        ai_used = False
+        ai_results_text = None
+        ai_discussion_text = None
+        ai_data = ai_generate_narrative(facts, anova, composite_label)
+        if ai_data:
+            ai_used = True
+            for rec, legend in zip(chart_records, ai_data["legends"]):
+                rec["legend"] = legend
+            ai_results_text = ai_data["results"]
+            ai_discussion_text = ai_data["discussion"]
+
         report_id = str(uuid.uuid4())
         REPORT_CACHE[report_id] = {
             "title": "GraphGen Pro - Automated Analysis Report",
             "iv_cols": iv_cols, "dv_cols": dv_cols,
             "chart_records": chart_records, "anova": anova,
             "composite_label": composite_label,
+            "ai_used": ai_used,
+            "ai_results_text": ai_results_text,
+            "ai_discussion_text": ai_discussion_text,
         }
         if len(REPORT_CACHE) > MAX_CACHE:
             REPORT_CACHE.pop(next(iter(REPORT_CACHE)))
@@ -416,6 +534,7 @@ def analyze():
             "total_charts": len(chart_records),
             "preview_charts": preview_records,
             "anova": anova_summary,
+            "ai_used": ai_used,
         })
 
     except Exception as e:
@@ -431,6 +550,9 @@ def download(report_id):
     out = build_docx(
         data["title"], data["iv_cols"], data["dv_cols"],
         data["chart_records"], data["anova"], data["composite_label"],
+        ai_results_text=data.get("ai_results_text"),
+        ai_discussion_text=data.get("ai_discussion_text"),
+        ai_used=data.get("ai_used", False),
     )
     return send_file(
         out, as_attachment=True,
