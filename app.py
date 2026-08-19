@@ -68,7 +68,8 @@ LIKERT_SCALES = [
     (["very low", "low", "moderate", "high", "very high"], 1),
     (["do not trust at all", "trust a little", "neutral", "trust"], 1),
     (["never", "occasionally", "monthly", "weekly", "daily"], 1),
-    (["no", "maybe", "yes"], 1),
+    (["yes", "no", "maybe"], 1),
+    (["yes", "no"], 1),
 ]
 
 
@@ -130,41 +131,108 @@ def to_numeric_dv(df, col):
 # Chart generation (SPSS-style grouped bar chart, % within each IV group)
 # ---------------------------------------------------------------------------
 
-SPSS_PALETTE = ["#4472C4", "#ED7D31", "#A5A5A5", "#FFC000", "#5B9BD5", "#70AD47"]
+# Colors sampled directly from real SPSS default categorical output
+# (blue / green / tan / ...), so generated charts read as genuine SPSS exports.
+SPSS_PALETTE = [
+    "#3E58AC", "#2EB848", "#D3CE97", "#8C564B",
+    "#9467BD", "#17BECF", "#E377C2", "#BCBD22",
+]
+SPSS_BG = "#F0F0F0"
+
+
+def _ordered_categories(series, prefer_likert=True):
+    """Return the category order to plot in: the recognized Likert-scale order
+    if one matches, otherwise first-appearance order (never alphabetical --
+    that's what makes SPSS output feel 'random' when re-implemented naively)."""
+    values = [v for v in series.dropna().unique().tolist()]
+    if prefer_likert:
+        norm_values = {_norm(v) for v in values}
+        for scale, _ in LIKERT_SCALES:
+            if norm_values.issubset(set(scale)) and len(norm_values) >= 2:
+                ordered = [s for s in scale if s in norm_values]
+                # map back to the original (non-normalized) string for each slot
+                lookup = {_norm(v): v for v in values}
+                return [lookup[o] for o in ordered if o in lookup]
+    return values  # first-appearance order
+
+
+def _wrap_label(text, width=18):
+    import textwrap
+    return "\n".join(textwrap.wrap(str(text), width=width)) or str(text)
 
 
 def make_bar_chart(df, iv, dv):
-    """Grouped bar chart: % of each DV category, split by IV group."""
+    """Grouped bar chart styled to match native SPSS output: light-gray plot
+    area, black axis border, SPSS categorical palette, boxed % data labels,
+    and the DV question wrapped as the legend title."""
     sub = df[[iv, dv]].dropna()
     if sub.empty or sub[iv].nunique() < 2 or sub[dv].nunique() < 2:
         return None, None
 
+    iv_order = _ordered_categories(sub[iv], prefer_likert=False)
+    dv_order = _ordered_categories(sub[dv], prefer_likert=True)
+
+    sub = sub.copy()
+    sub[iv] = pd.Categorical(sub[iv], categories=iv_order, ordered=True)
+    sub[dv] = pd.Categorical(sub[dv], categories=dv_order, ordered=True)
+
     ct = pd.crosstab(sub[iv], sub[dv], normalize="index") * 100
-    ct = ct.round(1)
+    ct = ct.reindex(columns=dv_order)
+    ct = ct.round(2)
 
-    # Smaller figsize/DPI keeps per-chart memory low -- important on Render's
-    # free 512MB instances where a report with 20+ charts can otherwise push
-    # the worker over its memory limit and get killed by the platform (which
-    # shows up to the browser as a bare, non-JSON "Internal Server Error"
-    # page rather than the app's own JSON error response).
-    fig, ax = plt.subplots(figsize=(5.4, 3.0), dpi=80)
+    n_cats = len(ct.columns)
+    fig, ax = plt.subplots(figsize=(6.2, 4.6), dpi=90)
     try:
-        ct.plot(kind="bar", ax=ax, color=SPSS_PALETTE[: len(ct.columns)], edgecolor="black", linewidth=0.5)
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor(SPSS_BG)
 
-        for container in ax.containers:
-            ax.bar_label(container, fmt="%.0f%%", fontsize=7, padding=1)
+        x = np.arange(len(ct.index))
+        n_groups = len(ct.index)
+        width = 0.8 / max(n_cats, 1)
 
-        ax.set_ylabel("Percent within group (%)", fontsize=9)
-        ax.set_xlabel(iv, fontsize=9)
-        ax.set_title(f"{dv}\nby {iv}", fontsize=10, wrap=True)
-        ax.legend(title=dv, fontsize=7, title_fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        plt.xticks(rotation=20, ha="right", fontsize=8)
+        for i, cat in enumerate(ct.columns):
+            vals = ct[cat].values
+            offset = (i - (n_cats - 1) / 2) * width
+            bars = ax.bar(
+                x + offset, vals, width=width,
+                color=SPSS_PALETTE[i % len(SPSS_PALETTE)],
+                edgecolor="black", linewidth=0.6, label=str(cat),
+            )
+            for rect, v in zip(bars, vals):
+                if v <= 0:
+                    continue
+                ax.annotate(
+                    f"{v:.2f}%",
+                    xy=(rect.get_x() + rect.get_width() / 2, v),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=7,
+                    bbox=dict(boxstyle="square,pad=0.25", fc="white", ec="black", lw=0.6),
+                )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(c) for c in ct.index], fontsize=9, fontweight="bold")
+        ax.set_ylabel("Percent", fontsize=10, fontweight="bold")
+        ax.set_xlabel(str(iv), fontsize=10, fontweight="bold")
+        ymax = max(ct.values.max() * 1.25, 10) if ct.values.size else 10
+        ax.set_ylim(0, ymax)
+
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_color("black")
+            spine.set_linewidth(0.8)
+
+        legend = ax.legend(
+            title=_wrap_label(dv, width=16),
+            fontsize=8, title_fontsize=8,
+            bbox_to_anchor=(1.02, 1), loc="upper left",
+            frameon=False, borderaxespad=0,
+        )
+        legend.get_title().set_ha("left")
+
         plt.tight_layout()
 
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight")
+        fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
         buf.seek(0)
         return buf.getvalue(), ct
     finally:
@@ -180,9 +248,10 @@ def auto_legend_text(iv, dv, ct):
         top_cat = ct.loc[top_group].idxmax()
         top_pct = ct.loc[top_group, top_cat]
         return (
-            f"The chart shows responses to \u201c{dv}\u201d broken down by {iv}. "
-            f"The {top_group} group shows the strongest single pattern: {top_pct:.0f}% selected "
-            f"\u201c{top_cat}\u201d, higher than any other group/category combination in this comparison."
+            f"The given figure represents the {iv}-wise distribution of respondents and their "
+            f"views on \u201c{dv}\u201d. The {top_group} group shows the strongest single pattern: "
+            f"{top_pct:.0f}% selected \u201c{top_cat}\u201d, higher than any other group/category "
+            f"combination in this comparison."
         )
     except Exception:
         return f"The chart compares {dv} across {iv} groups."
@@ -347,6 +416,131 @@ def run_anova(df, iv, dv_numeric_col_name, dv_values):
 
 
 # ---------------------------------------------------------------------------
+# SPSS-style statistical output tables, rendered as images (matplotlib table)
+# so they read as authentic SPSS "export table as image" output rather than
+# a native Word table.
+# ---------------------------------------------------------------------------
+
+def _spss_table_image(caption, col_labels, rows, footnote=None, col_widths=None):
+    """Render a classic SPSS output table (bold caption, thin horizontal
+    rules, no vertical grid lines, small italic footnote) to a PNG."""
+    n_rows = len(rows) + 1  # + header
+    n_cols = len(col_labels)
+    fig_w = max(4.2, 1.15 * n_cols)
+    fig_h = 0.42 * n_rows + 0.7
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+    ax.axis("off")
+
+    table = ax.table(
+        cellText=rows,
+        colLabels=col_labels,
+        cellLoc="center",
+        colLoc="center",
+        loc="center",
+        colWidths=col_widths,
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8.5)
+    table.scale(1, 1.6)
+
+    for (r, c), cell in table.get_celld().items():
+        cell.set_edgecolor("white")
+        cell.set_linewidth(0)
+        cell.set_text_props(color="black")
+        if r == 0:
+            cell.set_text_props(fontweight="bold")
+            cell.visible_edges = "TB"
+        elif r == n_rows - 1:
+            cell.visible_edges = "B"
+        else:
+            cell.visible_edges = ""
+        cell.set_edgecolor("black")
+
+    ax.set_title(caption, fontsize=10, fontweight="bold", pad=14)
+
+    if footnote:
+        fig.text(0.02, 0.02, footnote, fontsize=6.5, style="italic", ha="left", va="bottom")
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", dpi=150)
+    buf.seek(0)
+    data = buf.getvalue()
+    plt.close(fig)
+    return data
+
+
+def run_chi_square(df, iv, dv):
+    """Pearson chi-square test of independence on the iv x dv crosstab,
+    SPSS 'Chi-Square Tests' style (Pearson, Likelihood Ratio, Linear-by-Linear)."""
+    sub = df[[iv, dv]].dropna()
+    if sub.empty or sub[iv].nunique() < 2 or sub[dv].nunique() < 2:
+        return None
+    ct = pd.crosstab(sub[iv], sub[dv])
+    if ct.shape[0] < 2 or ct.shape[1] < 2:
+        return None
+    try:
+        chi2, p, dof, expected = stats.chi2_contingency(ct)
+    except Exception:
+        return None
+
+    # Likelihood ratio G-test (same df as Pearson chi-square)
+    try:
+        g_stat, g_p, _, _ = stats.chi2_contingency(ct, lambda_="log-likelihood")
+    except Exception:
+        g_stat, g_p = float("nan"), float("nan")
+
+    n_expected_low = int((expected < 5).sum())
+    pct_low = 100 * n_expected_low / expected.size if expected.size else 0
+    min_expected = float(expected.min()) if expected.size else float("nan")
+
+    return {
+        "iv": iv, "dv": dv,
+        "chi2": chi2, "p": p, "dof": dof,
+        "g_stat": g_stat, "g_p": g_p,
+        "n_valid": int(ct.values.sum()),
+        "n_expected_low": n_expected_low, "pct_expected_low": pct_low,
+        "min_expected": min_expected,
+    }
+
+
+def chi_square_table_image(cs):
+    def fmt_p(p):
+        return "<.001" if p < 0.001 else f"{p:.3f}"
+    rows = [
+        ["Pearson Chi-Square", f"{cs['chi2']:.3f}", str(cs["dof"]), fmt_p(cs["p"])],
+        ["Likelihood Ratio", f"{cs['g_stat']:.3f}", str(cs["dof"]), fmt_p(cs["g_p"])],
+        ["N of Valid Cases", "", "", str(cs["n_valid"])],
+    ]
+    footnote = (
+        f"{cs['n_expected_low']} cells ({cs['pct_expected_low']:.1f}%) have expected count "
+        f"less than 5. The minimum expected count is {cs['min_expected']:.2f}."
+    )
+    return _spss_table_image(
+        "Chi-Square Tests",
+        ["", "Value", "df", "Asymptotic Significance\n(2-sided)"],
+        rows, footnote=footnote, col_widths=[0.34, 0.18, 0.14, 0.34],
+    )
+
+
+def anova_table_image(anova):
+    def fmt_p(p):
+        return "<.001" if p < 0.001 else f"{p:.3f}"
+    rows = [
+        ["Between Groups", f"{anova['ss_between']:.3f}", str(anova["df_between"]),
+         f"{anova['ms_between']:.3f}", f"{anova['F']:.3f}", fmt_p(anova["p"])],
+        ["Within Groups", f"{anova['ss_within']:.3f}", str(anova["df_within"]),
+         f"{anova['ms_within']:.3f}", "", ""],
+        ["Total", f"{anova['ss_total']:.3f}", str(anova["df_between"] + anova["df_within"]), "", "", ""],
+    ]
+    return _spss_table_image(
+        "ANOVA",
+        ["", "Sum of Squares", "df", "Mean Square", "F", "Sig."],
+        rows, col_widths=[0.22, 0.18, 0.1, 0.18, 0.14, 0.14],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Word report builder
 # ---------------------------------------------------------------------------
 
@@ -366,7 +560,8 @@ def _labeled_paragraph(doc, label, text):
 
 
 def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
-                ai_results_sentences=None, ai_discussion_sentences=None, ai_used=False):
+                ai_results_sentences=None, ai_discussion_sentences=None, ai_used=False,
+                chi_square=None):
     doc = Document()
     _set_base_font(doc)
 
@@ -389,32 +584,40 @@ def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
         _labeled_paragraph(doc, "LEGEND", rec["legend"])
         doc.add_paragraph()
 
-    # ANOVA presented as its own numbered figure, SPSS "ANOVA" table style.
+    # Chi-Square Tests, presented as its own numbered figure -- an authentic
+    # SPSS "Chi-Square Tests" output table (rendered as an image, not a
+    # native Word table) for the primary IV x DV crosstab.
+    if chi_square is not None:
+        fig_num += 1
+        fig_p = doc.add_paragraph()
+        fig_p.add_run(f"FIGURE {fig_num}:").bold = True
+        doc.add_picture(io.BytesIO(chi_square_table_image(chi_square)), width=Inches(3.6))
+
+        cs_sig = chi_square["p"] < 0.05
+        cs_p_txt = "<.001" if chi_square["p"] < 0.001 else f"{chi_square['p']:.3f}"
+        _labeled_paragraph(
+            doc, "LEGEND",
+            f"This set of statistical outputs of Chi-Square presents a breakdown of respondent "
+            f"engagement and opinion across {chi_square['iv']} groups regarding {chi_square['dv']}."
+        )
+        _labeled_paragraph(
+            doc, "INTERPRETATION",
+            f"The Pearson Chi-Square value is {chi_square['chi2']:.3f} with {chi_square['dof']} "
+            f"degree(s) of freedom and a significance level of {cs_p_txt}, which is "
+            f"{'below' if cs_sig else 'above'} the conventional 0.05 threshold. This indicates "
+            f"that {chi_square['iv']} and {chi_square['dv']} "
+            f"{'are' if cs_sig else 'are not'} significantly associated, based on "
+            f"{chi_square['n_valid']} valid cases."
+        )
+        doc.add_paragraph()
+
+    # ANOVA presented as its own numbered figure -- an authentic SPSS "ANOVA"
+    # output table (image), not a native Word table.
     if anova is not None:
         fig_num += 1
         fig_p = doc.add_paragraph()
         fig_p.add_run(f"FIGURE {fig_num}:").bold = True
-
-        cap = doc.add_paragraph()
-        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        cap_run = cap.add_run("ANOVA")
-        cap_run.bold = True
-
-        table = doc.add_table(rows=4, cols=6)
-        table.style = "Table Grid"
-        hdr = table.rows[0].cells
-        for i, txt in enumerate(["Source", "Sum of Squares", "df", "Mean Square", "F", "Sig."]):
-            hdr[i].text = txt
-            hdr[i].paragraphs[0].runs[0].bold = True
-        rows_data = [
-            ("Between Groups", anova["ss_between"], anova["df_between"], anova["ms_between"], f"{anova['F']:.3f}", f"{anova['p']:.3f}"),
-            ("Within Groups", anova["ss_within"], anova["df_within"], anova["ms_within"], "", ""),
-            ("Total", anova["ss_total"], anova["df_between"] + anova["df_within"], "", "", ""),
-        ]
-        for r, row in enumerate(rows_data, start=1):
-            cells = table.rows[r].cells
-            for c, val in enumerate(row):
-                cells[c].text = f"{val:.3f}" if isinstance(val, float) else str(val)
+        doc.add_picture(io.BytesIO(anova_table_image(anova)), width=Inches(4.0))
         doc.add_paragraph()
 
         sig_txt = (
@@ -513,9 +716,11 @@ def analyze():
         if not iv_cols or not dv_cols:
             return jsonify({"error": "Could not detect independent/dependent variables automatically."}), 400
 
-        # cap total charts for a snappy, low-memory free-tier response
-        # (override with the MAX_CHARTS env var on Render if you need more/fewer)
-        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 6))
+        # Generate every IV x DV combination by default (matches real SPSS
+        # exports, which don't sample a subset of charts). MAX_CHARTS is a
+        # safety ceiling, not a target -- raise it via env var if you have a
+        # very wide survey and hit Render free-tier memory/time limits.
+        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 200))
         chart_records = []
         preview_records = []
         facts = []
@@ -542,10 +747,16 @@ def analyze():
                 numeric_cols.append(numeric_series.rename(dv))
         anova = None
         composite_label = "overall attitude score"
+        primary_iv = iv_cols[0]
         if numeric_cols:
             composite = pd.concat(numeric_cols, axis=1).mean(axis=1)
-            primary_iv = iv_cols[0]
             anova = run_anova(df, primary_iv, composite_label, composite)
+
+        # Chi-Square Tests figure: primary IV x primary (first) DV crosstab,
+        # matching the "Chi-Square Tests" output block seen in real SPSS reports.
+        chi_square = None
+        if dv_cols:
+            chi_square = run_chi_square(df, primary_iv, dv_cols[0])
 
         # Try one batched Groq call to write every legend + per-chart Results/Discussion
         # sentences. Falls back silently (ai_used=False) if no key is set or the call fails.
@@ -568,6 +779,7 @@ def analyze():
             ai_results_sentences=ai_results_sentences,
             ai_discussion_sentences=ai_discussion_sentences,
             ai_used=ai_used,
+            chi_square=chi_square,
         )
         report_bytes = report_docx.getvalue()
         del report_docx  # the in-memory Document + all its embedded images
