@@ -181,7 +181,7 @@ def make_bar_chart(df, iv, dv):
     ct = ct.round(2)
 
     n_cats = len(ct.columns)
-    fig, ax = plt.subplots(figsize=(6.2, 4.6), dpi=90)
+    fig, ax = plt.subplots(figsize=(6.2, 4.6), dpi=80)
     try:
         fig.patch.set_facecolor("white")
         ax.set_facecolor(SPSS_BG)
@@ -428,7 +428,7 @@ def _spss_table_image(caption, col_labels, rows, footnote=None, col_widths=None)
     n_cols = len(col_labels)
     fig_w = max(4.2, 1.15 * n_cols)
     fig_h = 0.42 * n_rows + 0.7
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=110)
     ax.axis("off")
 
     table = ax.table(
@@ -463,7 +463,7 @@ def _spss_table_image(caption, col_labels, rows, footnote=None, col_widths=None)
 
     plt.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", dpi=150)
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", dpi=110)
     buf.seek(0)
     data = buf.getvalue()
     plt.close(fig)
@@ -561,7 +561,7 @@ def _labeled_paragraph(doc, label, text):
 
 def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
                 ai_results_sentences=None, ai_discussion_sentences=None, ai_used=False,
-                chi_square=None):
+                chi_square=None, charts_capped=False, total_possible=None):
     doc = Document()
     _set_base_font(doc)
 
@@ -569,6 +569,17 @@ def build_docx(title, iv_cols, dv_cols, chart_records, anova, composite_label,
     title_p = doc.add_paragraph()
     title_p.add_run("ADDITIONAL ANALYSIS").bold = True
     doc.add_paragraph()
+
+    if charts_capped:
+        note_p = doc.add_paragraph()
+        note_run = note_p.add_run(
+            f"Note: This spreadsheet had {total_possible} possible variable-pair charts. "
+            f"Only the first {len(chart_records)} are included below to keep the report "
+            f"within server memory limits. Set the MAX_CHARTS environment variable higher "
+            f"if you're self-hosting and need every combination."
+        )
+        note_run.italic = True
+        doc.add_paragraph()
 
     fig_num = 0
 
@@ -717,18 +728,21 @@ def analyze():
             return jsonify({"error": "Could not detect independent/dependent variables automatically."}), 400
 
         # Generate every IV x DV combination by default (matches real SPSS
-        # exports, which don't sample a subset of charts). MAX_CHARTS is a
-        # safety ceiling, not a target -- raise it via env var if you have a
-        # very wide survey and hit Render free-tier memory/time limits.
-        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 200))
+        # exports, which don't sample a subset of charts) -- but cap the
+        # total so a wide/long spreadsheet can't OOM-kill a free-tier Render
+        # worker (512MB RAM). Unlike the old silent 6-chart cap, we tell the
+        # caller (and the user, via the UI) whenever the cap actually bites.
+        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 60))
         chart_records = []
         preview_records = []
         facts = []
         count = 0
+        total_possible = 0
         for dv in dv_cols:
             for iv in iv_cols:
+                total_possible += 1
                 if count >= MAX_CHARTS:
-                    break
+                    continue
                 png, ct = make_bar_chart(df, iv, dv)
                 if png is None:
                     continue
@@ -736,8 +750,11 @@ def analyze():
                 chart_records.append({"iv": iv, "dv": dv, "png": png, "legend": fallback_legend, "ct": ct})
                 facts.append(chart_fact(iv, dv, ct))
                 count += 1
-            if count >= MAX_CHARTS:
-                break
+                if count % 20 == 0:
+                    # Release matplotlib/pandas intermediates periodically so
+                    # memory doesn't climb monotonically across a long loop.
+                    gc.collect()
+        charts_capped = total_possible > count
 
         # Build a composite DV score (mean of all Likert-encoded DVs) for the ANOVA
         numeric_cols = []
@@ -780,6 +797,8 @@ def analyze():
             ai_discussion_sentences=ai_discussion_sentences,
             ai_used=ai_used,
             chi_square=chi_square,
+            charts_capped=charts_capped,
+            total_possible=total_possible,
         )
         report_bytes = report_docx.getvalue()
         del report_docx  # the in-memory Document + all its embedded images
@@ -817,6 +836,8 @@ def analyze():
             "n_rows": int(n_rows),
             "iv_cols": iv_cols, "dv_cols": dv_cols,
             "total_charts": len(chart_records),
+            "total_possible_charts": total_possible,
+            "charts_capped": charts_capped,
             "preview_charts": preview_records,
             "anova": anova_summary,
             "ai_used": ai_used,
