@@ -19,6 +19,8 @@ import gc
 import json
 import base64
 import uuid
+import time
+import threading
 import traceback
 
 import pandas as pd
@@ -51,6 +53,21 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # keep Render free-tier requ
 # Fine for a single small Render instance; swap for redis/db if you need more.
 REPORT_CACHE = {}
 MAX_CACHE = 2
+
+# In-memory job store. /analyze no longer does the heavy work inline -- it
+# kicks off a background thread and returns instantly. This matters a lot on
+# Render's free tier: the platform's own edge proxy enforces a request
+# timeout that's *shorter* than gunicorn's --timeout flag and can't be
+# raised from app code, and free instances also only get a sliver of CPU.
+# A synchronous request that takes even ~30-60s (very possible once you add
+# a slow CPU + a Groq network call + 20-60 chart renders) gets killed by
+# that proxy, which returns a generic HTML "Internal Server Error" page --
+# not something Flask's own error handlers ever see, which is why that page
+# has no useful detail. Polling short, fast /status requests instead sidesteps
+# the proxy timeout entirely, no matter how long the analysis itself takes.
+JOBS = {}
+MAX_JOBS = 8
+JOBS_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Column classification
@@ -721,45 +738,44 @@ def index():
     return render_template("index.html")
 
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
+def _set_job(job_id, **fields):
+    with JOBS_LOCK:
+        JOBS[job_id].update(fields)
+
+
+def _run_analysis_job(job_id, file_bytes, filename):
+    """Does all the heavy lifting (chart rendering, ANOVA, Groq call, docx
+    build) in a background thread, writing progress/result into JOBS[job_id]
+    instead of returning an HTTP response. See JOBS comment above for why."""
     try:
-        f = request.files.get("file")
-        if not f:
-            return jsonify({"error": "No file uploaded."}), 400
+        _set_job(job_id, status="processing", stage="Reading spreadsheet...")
 
-        # Cap extremely large spreadsheets *before* fully loading them --
-        # capping rows only after pd.read_csv/read_excel has already parsed
-        # the entire file into memory doesn't help; a large/wide file can
-        # OOM the 512MB Render free instance during the read itself,
-        # especially .xlsx (openpyxl commonly uses 10-20x the file's raw
-        # size in RAM). Reading with nrows keeps peak memory bounded by the
-        # cap, not by the uploaded file's size.
         MAX_ROWS = int(os.environ.get("MAX_ROWS", 1500))
-
-        filename = f.filename.lower()
+        buf = io.BytesIO(file_bytes)
         if filename.endswith(".csv"):
-            df = pd.read_csv(f, nrows=MAX_ROWS)
+            df = pd.read_csv(buf, nrows=MAX_ROWS)
         else:
-            df = pd.read_excel(f, nrows=MAX_ROWS)
+            df = pd.read_excel(buf, nrows=MAX_ROWS)
 
         df = df.dropna(axis=1, how="all")
         if df.empty:
-            return jsonify({"error": "The file has no usable data."}), 400
+            _set_job(job_id, status="error", error="The file has no usable data.")
+            return
 
         # Clean up messy header text (stray newlines/whitespace from form exports)
         df.columns = [" ".join(str(c).split()) for c in df.columns]
 
         iv_cols, dv_cols = classify_columns(df)
         if not iv_cols or not dv_cols:
-            return jsonify({"error": "Could not detect independent/dependent variables automatically."}), 400
+            _set_job(job_id, status="error",
+                      error="Could not detect independent/dependent variables automatically.")
+            return
 
         # Generate every IV x DV combination by default (matches real SPSS
         # exports, which don't sample a subset of charts) -- but cap the
-        # total so a wide/long spreadsheet can't OOM-kill a free-tier Render
-        # worker (512MB RAM). Unlike the old silent 6-chart cap, we tell the
-        # caller (and the user, via the UI) whenever the cap actually bites.
-        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 60))
+        # total so a wide/long spreadsheet can't OOM or run forever on a
+        # free-tier Render worker (512MB RAM, a fraction of a CPU core).
+        MAX_CHARTS = int(os.environ.get("MAX_CHARTS", 40))
         chart_records = []
         preview_records = []
         facts = []
@@ -777,11 +793,14 @@ def analyze():
                 chart_records.append({"iv": iv, "dv": dv, "png": png, "legend": fallback_legend, "ct": ct})
                 facts.append(chart_fact(iv, dv, ct))
                 count += 1
+                if count % 10 == 0:
+                    _set_job(job_id, stage=f"Generated {count} charts...")
                 if count % 20 == 0:
                     # Release matplotlib/pandas intermediates periodically so
                     # memory doesn't climb monotonically across a long loop.
                     gc.collect()
         charts_capped = total_possible > count
+        _set_job(job_id, stage="Running ANOVA / Chi-Square...")
 
         # Build a composite DV score (mean of all Likert-encoded DVs) for the ANOVA
         numeric_cols = []
@@ -804,6 +823,7 @@ def analyze():
 
         # Try one batched Groq call to write every legend + per-chart Results/Discussion
         # sentences. Falls back silently (ai_used=False) if no key is set or the call fails.
+        _set_job(job_id, stage="Writing narrative...")
         ai_used = False
         ai_results_sentences = None
         ai_discussion_sentences = None
@@ -816,7 +836,8 @@ def analyze():
             ai_discussion_sentences = ai_data["discussion_sentences"]
 
         # Build the DOCX once during analysis. Rebuilding all charts inside
-        # /download could exceed Render's request timeout and return an HTML 500 page.
+        # /download could exceed the request timeout and return an HTML 500 page.
+        _set_job(job_id, stage="Building Word report...")
         title = "GraphGen Pro - Automated Analysis Report"
         report_docx = build_docx(
             title, iv_cols, dv_cols, chart_records, anova, composite_label,
@@ -858,28 +879,81 @@ def analyze():
                 "significant": anova["significant"],
             }
 
-        return jsonify({
-            "report_id": report_id,
-            "n_rows": int(n_rows),
-            "iv_cols": iv_cols, "dv_cols": dv_cols,
-            "total_charts": len(chart_records),
-            "total_possible_charts": total_possible,
-            "charts_capped": charts_capped,
-            "preview_charts": preview_records,
-            "anova": anova_summary,
-            "ai_used": ai_used,
-        })
+        _set_job(
+            job_id,
+            status="done",
+            result={
+                "report_id": report_id,
+                "n_rows": int(n_rows),
+                "iv_cols": iv_cols, "dv_cols": dv_cols,
+                "total_charts": len(chart_records),
+                "total_possible_charts": total_possible,
+                "charts_capped": charts_capped,
+                "preview_charts": preview_records,
+                "anova": anova_summary,
+                "ai_used": ai_used,
+            },
+        )
 
     except MemoryError:
         traceback.print_exc()
         gc.collect()
-        return jsonify({
-            "error": "The file is too large/complex to process on this server's memory limit. "
-                     "Try a smaller file, fewer columns, or lower MAX_ROWS/MAX_CHARTS."
-        }), 500
+        _set_job(
+            job_id, status="error",
+            error="The file is too large/complex to process on this server's memory limit. "
+                  "Try a smaller file, fewer columns, or lower MAX_ROWS/MAX_CHARTS.",
+        )
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": f"Something went wrong: {e}"}), 500
+        _set_job(job_id, status="error", error=f"Something went wrong: {e}")
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "No file uploaded."}), 400
+
+    filename = f.filename.lower()
+    if not (filename.endswith(".csv") or filename.endswith(".xlsx") or filename.endswith(".xls")):
+        return jsonify({"error": "Please upload a .csv, .xlsx, or .xls file."}), 400
+
+    # Read the upload into memory now (fast) and hand the bytes to a
+    # background thread that does the actual analysis. This lets /analyze
+    # respond in well under a second, no matter how long the analysis takes --
+    # important because Render's free-tier edge proxy enforces its own short
+    # request timeout that can silently kill a long-running synchronous
+    # request before Flask ever gets to send a response.
+    file_bytes = f.read()
+
+    job_id = str(uuid.uuid4())
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "processing", "stage": "Queued...", "created": time.time()}
+        if len(JOBS) > MAX_JOBS:
+            oldest = min(JOBS, key=lambda k: JOBS[k]["created"])
+            if oldest != job_id:
+                JOBS.pop(oldest, None)
+
+    thread = threading.Thread(target=_run_analysis_job, args=(job_id, file_bytes, filename), daemon=True)
+    thread.start()
+
+    return jsonify({"job_id": job_id}), 202
+
+
+@app.route("/status/<job_id>")
+def status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found. Please re-analyze your file."}), 404
+
+    if job["status"] == "error":
+        return jsonify({"status": "error", "error": job.get("error", "Something went wrong.")})
+    if job["status"] == "done":
+        payload = dict(job["result"])
+        payload["status"] = "done"
+        return jsonify(payload)
+    return jsonify({"status": "processing", "stage": job.get("stage", "Working...")})
 
 
 @app.route("/download/<report_id>")
@@ -917,7 +991,8 @@ def request_too_large(error):
 def handle_unexpected_error(error):
     # API routes return JSON instead of Flask/Render's HTML error page.
     traceback.print_exc()
-    if request.path.startswith("/analyze") or request.path.startswith("/download/"):
+    if (request.path.startswith("/analyze") or request.path.startswith("/download/")
+            or request.path.startswith("/status/")):
         return jsonify({"error": "Internal server error. Check the server logs for details."}), 500
     return error
 
