@@ -78,16 +78,38 @@ def _norm(v):
 
 
 def classify_columns(df):
-    """Return (iv_cols, dv_cols) using simple, transparent heuristics."""
+    """Return (iv_cols, dv_cols) using simple, transparent heuristics.
+    Columns with too many unique values (free-text fields, IDs, emails,
+    "Other, please specify" boxes, etc.) are dropped entirely -- they can't
+    be turned into a meaningful bar chart, and attempting to chart one with
+    hundreds/thousands of categories is what actually blows up memory/time
+    on a real spreadsheet (confirmed: a single such column can take 10+
+    seconds and ~300MB to plot on its own)."""
+    MAX_IV_CATEGORIES = 15
+    MAX_DV_CATEGORIES = 10
+    n_rows = max(len(df), 1)
+
     iv_cols, dv_cols = [], []
     for col in df.columns:
         lc = col.lower().strip()
         if lc == "timestamp" or lc.startswith("unnamed"):
             continue
+
+        nunique = df[col].nunique(dropna=True)
+        # Free-text/ID-like columns: skip regardless of keyword match --
+        # e.g. near-one-unique-value-per-row (emails, comments, "specify
+        # other") isn't a chartable categorical variable.
+        if nunique <= 1 or nunique > 0.5 * n_rows:
+            continue
+
         if any(k in lc for k in IV_KEYWORDS):
-            iv_cols.append(col)
+            if nunique <= MAX_IV_CATEGORIES:
+                iv_cols.append(col)
+            # else: looks like an IV by name but has too many distinct
+            # values (e.g. a free-text "age" comment field) -- skip it.
         else:
-            dv_cols.append(col)
+            if nunique <= MAX_DV_CATEGORIES:
+                dv_cols.append(col)
     return iv_cols, dv_cols
 
 
@@ -167,6 +189,11 @@ def make_bar_chart(df, iv, dv):
     and the DV question wrapped as the legend title."""
     sub = df[[iv, dv]].dropna()
     if sub.empty or sub[iv].nunique() < 2 or sub[dv].nunique() < 2:
+        return None, None
+    # Hard safety ceiling regardless of how the column was classified --
+    # a chart with dozens of x-axis groups or legend entries isn't
+    # meaningful anyway, and rendering one can spike memory/CPU sharply.
+    if sub[iv].nunique() > 15 or sub[dv].nunique() > 10:
         return None, None
 
     iv_order = _ordered_categories(sub[iv], prefer_likert=False)
