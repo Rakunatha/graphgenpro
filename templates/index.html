@@ -228,6 +228,16 @@ function renderResults(data){
 
   chartNote.textContent = `Showing a preview of ${Math.min(data.preview_charts.length, data.total_charts)} of ${data.total_charts} charts. The Word report includes all of them.`;
 
+  const existingCapNote = document.getElementById('capNote');
+  if (existingCapNote) existingCapNote.remove();
+  if (data.charts_capped) {
+    const capNote = document.createElement('div');
+    capNote.id = 'capNote';
+    capNote.style.cssText = 'background:#fff4e5;color:#8a5a00;border-radius:8px;padding:10px 14px;margin-top:10px;font-size:13px;text-align:center;';
+    capNote.textContent = `Heads up: your spreadsheet has ${data.total_possible_charts} possible variable-pair charts. To avoid crashing the server, only the first ${data.total_charts} are included in this report.`;
+    chartNote.insertAdjacentElement('afterend', capNote);
+  }
+
   chartsContainer.innerHTML = '';
   data.preview_charts.forEach(c => {
     const div = document.createElement('div');
