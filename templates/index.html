@@ -148,10 +148,54 @@ function handleFileChosen(){
   }
 }
 
+async function readJsonSafely(res) {
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    return await res.json();
+  }
+  // Server (or a proxy in front of it) returned something that isn't JSON —
+  // most often an HTML error page. Surface a readable message instead of
+  // letting JSON.parse throw "Unexpected token '<'".
+  const raw = await res.text();
+  throw new Error(
+    `Server returned an unexpected response (status ${res.status}). ` +
+    `Details: ${raw.slice(0, 200)}`
+  );
+}
+
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function pollJob(jobId){
+  // Poll a lightweight /status endpoint instead of waiting on one long
+  // /analyze request. Free hosting tiers commonly kill a single HTTP
+  // request that runs longer than ~30-60s (regardless of the app's own
+  // timeout settings) and return a generic HTML error page when they do.
+  // Short, fast polling requests sidestep that limit no matter how long
+  // the analysis itself takes.
+  const maxAttempts = 300; // ~10 minutes at 2s/poll, generous ceiling
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const res = await fetch('/status/' + jobId);
+    const data = await readJsonSafely(res);
+
+    if (!res.ok || data.error) {
+      throw new Error(data.error || `Analysis failed (status ${res.status}).`);
+    }
+    if (data.status === 'error') {
+      throw new Error(data.error || 'Analysis failed.');
+    }
+    if (data.status === 'done') {
+      return data;
+    }
+    statusMsg.textContent = data.stage || 'Analyzing your data...';
+    await sleep(2000);
+  }
+  throw new Error('Analysis is taking unusually long. Please try again with a smaller file.');
+}
+
 analyzeBtn.addEventListener('click', async () => {
   if (!fileInput.files.length) return;
   spinner.style.display = 'block';
-  statusMsg.textContent = 'Analyzing your data... (large files with many charts can take a minute or two)';
+  statusMsg.textContent = 'Uploading...';
   statusMsg.classList.remove('err');
   analyzeBtn.disabled = true;
   resultsCard.classList.add('hidden');
@@ -160,32 +204,18 @@ analyzeBtn.addEventListener('click', async () => {
   formData.append('file', fileInput.files[0]);
 
   try {
-    const res = await fetch('/analyze', { method: 'POST', body: formData });
+    const startRes = await fetch('/analyze', { method: 'POST', body: formData });
+    const startData = await readJsonSafely(startRes);
 
-    const contentType = res.headers.get('content-type') || '';
-    let data;
-    if (contentType.includes('application/json')) {
-      data = await res.json();
-    } else {
-      // Server (or a proxy in front of it) returned something that isn't JSON —
-      // most often an HTML error page. Surface a readable message instead of
-      // letting JSON.parse throw "Unexpected token '<'".
-      const raw = await res.text();
-      throw new Error(
-        `Server returned an unexpected response (status ${res.status}). ` +
-        `This usually means the request timed out or the file is too large/complex. ` +
-        `Try a smaller file, or check the server logs. Details: ${raw.slice(0, 200)}`
-      );
+    if (!startRes.ok || startData.error) {
+      throw new Error(startData.error || `Could not start analysis (status ${startRes.status}).`);
     }
+
+    statusMsg.textContent = 'Analyzing your data... (large files with many charts can take a minute or two)';
+    const data = await pollJob(startData.job_id);
 
     spinner.style.display = 'none';
     analyzeBtn.disabled = false;
-
-    if (!res.ok || data.error) {
-      statusMsg.textContent = data.error || `Analysis failed (status ${res.status}).`;
-      statusMsg.classList.add('err');
-      return;
-    }
     statusMsg.textContent = 'Done!';
     currentReportId = data.report_id;
     renderResults(data);
